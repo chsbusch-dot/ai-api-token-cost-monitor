@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>costwatch</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0e1116; --panel: #161a22; --border: #2a2f3a;
+      --fg: #e6e6e6; --muted: #8a93a3; --accent: #4cc4ff;
+      --good: #4ade80; --warn: #f5b942; --bad: #ff6b6b;
+      --anthropic: #d97757; --openai: #10a37f; --gemini: #4285f4; --deepgram: #ff3b8c;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif;
+           background: var(--bg); color: var(--fg); }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 20px; }
+    h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.08em;
+         text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
+    .total { font-size: 56px; font-weight: 700; letter-spacing: -0.02em; }
+    .total .stale { color: var(--muted); }
+    .sub { color: var(--muted); margin-bottom: 28px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .card { background: var(--panel); border: 1px solid var(--border);
+            border-radius: 10px; padding: 16px; }
+    .card .label { font-size: 11px; text-transform: uppercase;
+                   letter-spacing: 0.08em; color: var(--muted); margin-bottom: 6px;
+                   display: flex; align-items: center; gap: 8px; }
+    .card .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .card .value { font-size: 28px; font-weight: 600; }
+    .card .err { color: var(--bad); font-size: 13px; }
+    .card .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+    .a .dot { background: var(--anthropic); }
+    .o .dot { background: var(--openai); }
+    .g .dot { background: var(--gemini); }
+    .d .dot { background: var(--deepgram); }
+    .conn { display: inline-block; padding: 2px 8px; border-radius: 4px;
+            font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .conn.live { background: rgba(74,222,128,0.15); color: var(--good); }
+    .conn.stale { background: rgba(245,185,66,0.15); color: var(--warn); }
+    .conn.dead { background: rgba(255,107,107,0.15); color: var(--bad); }
+    .models { margin-top: 28px; }
+    .models table { width: 100%; border-collapse: collapse; }
+    .models th, .models td { text-align: left; padding: 8px 12px;
+                              border-bottom: 1px solid var(--border); }
+    .models th { font-size: 11px; text-transform: uppercase;
+                  letter-spacing: 0.08em; color: var(--muted); }
+    .models td.r { text-align: right; font-variant-numeric: tabular-nums; }
+    footer { margin-top: 32px; color: var(--muted); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>total spent today <span id="conn" class="conn dead">connecting</span></h1>
+    <div class="total"><span id="total">—</span></div>
+    <div class="sub" id="ts">no data yet</div>
+
+    <div class="grid">
+      <div class="card a">
+        <div class="label"><span class="dot"></span>anthropic</div>
+        <div class="value" id="anthropic">—</div>
+      </div>
+      <div class="card o">
+        <div class="label"><span class="dot"></span>openai</div>
+        <div class="value" id="openai">—</div>
+      </div>
+      <div class="card g">
+        <div class="label"><span class="dot"></span>gemini</div>
+        <div class="value" id="gemini">—</div>
+        <div class="note">local token tracking</div>
+      </div>
+      <div class="card d">
+        <div class="label"><span class="dot"></span>deepgram balance</div>
+        <div class="value" id="deepgram">—</div>
+        <div class="note">prepaid; remaining credit</div>
+        <div class="err" id="deepgram_err"></div>
+      </div>
+    </div>
+
+    <div class="chart-wrap" style="margin-top:32px;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;">
+      <h1 style="margin:0 0 12px;">14-day spend</h1>
+      <div style="position:relative;height:280px;"><canvas id="chart"></canvas></div>
+    </div>
+
+    <div class="models">
+      <h1>by model (current process)</h1>
+      <table>
+        <thead><tr><th>model</th><th class="r">requests</th>
+                   <th class="r">input</th><th class="r">output</th>
+                   <th class="r">USD</th></tr></thead>
+        <tbody id="models"><tr><td colspan="5" style="color:var(--muted)">no model activity in this process</td></tr></tbody>
+      </table>
+    </div>
+
+    <footer>
+      costwatch · polling provider Cost APIs every <span id="interval">60</span>s
+    </footer>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const fmtUSD = (v) => v == null ? "—" : "$" + v.toFixed(4);
+    const fmtBal = (v) => v == null ? "—" : "$" + v.toFixed(2);
+
+    let lastTickAt = 0;
+    function setConn(state) {
+      const el = $("conn");
+      el.className = "conn " + state;
+      el.textContent = state;
+    }
+
+    function render(p) {
+      lastTickAt = Date.now();
+      $("total").textContent = fmtUSD(p.total_today_usd);
+      $("anthropic").textContent = fmtUSD(p.anthropic_today_usd);
+      $("openai").textContent = fmtUSD(p.openai_today_usd);
+      $("gemini").textContent = fmtUSD(p.gemini_today_usd);
+      $("deepgram").textContent = fmtBal(p.deepgram_balance_usd);
+      $("deepgram_err").textContent = p.deepgram_error || "";
+      $("ts").textContent = "updated " + new Date().toLocaleTimeString();
+      setConn("live");
+      updateTodayInChart(p);
+
+      const tbody = $("models");
+      const entries = Object.entries(p.by_model || {});
+      if (entries.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">no model activity in this process</td></tr>';
+        return;
+      }
+      tbody.innerHTML = entries.map(([m, s]) =>
+        `<tr><td>${m}</td><td class="r">${s.requests}</td>
+         <td class="r">${s.input_tokens.toLocaleString()}</td>
+         <td class="r">${s.output_tokens.toLocaleString()}</td>
+         <td class="r">$${s.cost_usd.toFixed(5)}</td></tr>`
+      ).join("");
+    }
+
+    let chart = null;
+    const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    const colors = { anthropic: css("--anthropic"), openai: css("--openai"), gemini: css("--gemini") };
+
+    async function loadChart() {
+      const r = await fetch("/api/history?days=14");
+      const j = await r.json();
+      const labels = j.series.map(s => s.date);
+      const dgColor = css("--deepgram");
+      const barDatasets = ["anthropic", "openai", "gemini"].map(prov => ({
+        type: "bar", label: prov, backgroundColor: colors[prov], stack: "spend",
+        data: j.series.map(s => s[prov] || 0), yAxisID: "y",
+      }));
+      const dgDataset = {
+        type: "line", label: "deepgram balance",
+        data: j.series.map(s => s.deepgram_balance),
+        borderColor: dgColor, backgroundColor: dgColor + "33",
+        borderWidth: 2, tension: 0.25, pointRadius: 3, pointHoverRadius: 5,
+        fill: false, spanGaps: true, yAxisID: "y1",
+      };
+      const ctx = document.getElementById("chart").getContext("2d");
+      if (chart) chart.destroy();
+      chart = new Chart(ctx, {
+        data: { labels, datasets: [...barDatasets, dgDataset] },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false },
+          scales: {
+            x: { stacked: true, grid: { color: "#222831" }, ticks: { color: "#8a93a3" } },
+            y: {
+              stacked: true, position: "left",
+              title: { display: true, text: "spend (USD)", color: "#8a93a3" },
+              grid: { color: "#222831" },
+              ticks: { color: "#8a93a3", callback: v => "$" + v.toFixed(2) },
+            },
+            y1: {
+              position: "right", grid: { drawOnChartArea: false },
+              title: { display: true, text: "deepgram balance (USD)", color: dgColor },
+              ticks: { color: dgColor, callback: v => "$" + Number(v).toFixed(0) },
+            },
+          },
+          plugins: {
+            legend: { labels: { color: "#e6e6e6", boxWidth: 12 } },
+            tooltip: { callbacks: {
+              label: (c) => c.dataset.label === "deepgram balance"
+                ? `deepgram balance: $${c.parsed.y?.toFixed(2) ?? "—"} remaining`
+                : `${c.dataset.label}: $${c.parsed.y.toFixed(4)}`,
+              footer: (items) => {
+                const spend = items
+                  .filter(i => i.dataset.label !== "deepgram balance")
+                  .reduce((s, i) => s + i.parsed.y, 0);
+                return "spend total: $" + spend.toFixed(4);
+              },
+            } },
+          },
+        },
+      });
+    }
+
+    function updateTodayInChart(p) {
+      if (!chart) return;
+      const today = new Date().toISOString().slice(0, 10);
+      let idx = chart.data.labels.indexOf(today);
+      if (idx === -1) {
+        chart.data.labels.push(today);
+        chart.data.datasets.forEach(ds => ds.data.push(ds.label === "deepgram balance" ? null : 0));
+        idx = chart.data.labels.length - 1;
+      }
+      chart.data.datasets[0].data[idx] = p.anthropic_today_usd ?? 0;
+      chart.data.datasets[1].data[idx] = p.openai_today_usd ?? 0;
+      chart.data.datasets[2].data[idx] = p.gemini_today_usd ?? 0;
+      chart.data.datasets[3].data[idx] = p.deepgram_balance_usd ?? null;
+      chart.update("none");
+    }
+
+    function connect() {
+      const es = new EventSource("/api/now");
+      es.addEventListener("spend", (ev) => {
+        try { render(JSON.parse(ev.data)); } catch (e) { console.error(e); }
+      });
+      es.onerror = () => { setConn("dead"); es.close(); setTimeout(connect, 2000); };
+    }
+
+    setInterval(() => {
+      if (lastTickAt && Date.now() - lastTickAt > 90000) setConn("stale");
+    }, 5000);
+
+    // Refresh full history once per hour to absorb any backfill / midnight rollover.
+    setInterval(loadChart, 3600 * 1000);
+
+    loadChart();
+    connect();
+  </script>
+</body>
+</html>

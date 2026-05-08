@@ -1,0 +1,10 @@
+[Unit]
+Description=Run costwatch digest daily at 18:00 local time
+
+[Timer]
+OnCalendar=*-*-* 18:00:00
+Persistent=true
+Unit=costwatch-digest.service
+
+[Install]
+WantedBy=timers.target

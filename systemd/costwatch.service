@@ -1,0 +1,15 @@
+[Unit]
+Description=costwatch — AI cost monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/token-watch
+EnvironmentFile=%h/token-watch/.env
+ExecStart=%h/token-watch/.venv/bin/python -m costwatch
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
