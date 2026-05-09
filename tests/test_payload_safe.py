@@ -18,6 +18,8 @@ ALLOWED_TOP_LEVEL_KEYS = {
     "anthropic_today_usd",
     "openai_today_usd",
     "gemini_today_usd",
+    "anthropic_balance_usd",
+    "anthropic_balance_error",
     "deepgram_balance_usd",
     "deepgram_error",
     "by_model",

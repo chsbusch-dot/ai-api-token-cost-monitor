@@ -70,6 +70,115 @@ async def fetch_deepgram_balance(api_key: str, tracker: BillingTracker) -> None:
         # Don't set a permanent error for transient network failures.
 
 
+# ── Anthropic prepaid credit balance (browser session cookie required) ─────
+
+def _parse_balance_usd(data) -> Optional[float]:
+    """Extract a USD balance from the Anthropic console response.
+
+    Real shape (verified 2026-05):
+        {"amount": 672, "currency": "USD",
+         "auto_reload_settings": {...}, ...}
+
+    `amount` is in MINOR units (cents for USD). The fallback paths handle
+    other shapes in case Anthropic changes the API.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    # Anthropic console shape: amount + currency, value in minor units.
+    if "amount" in data and isinstance(data["amount"], (int, float)):
+        amount = float(data["amount"])
+        currency = (data.get("currency") or "USD").upper()
+        if currency == "USD":
+            return amount / 100.0  # cents → dollars
+        # Non-USD: best-effort. Caller can interpret based on dashboard label.
+        return amount / 100.0
+
+    # Fallback shapes — kept defensively in case the API changes.
+    def _coerce(v) -> Optional[float]:
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            try:
+                return float(v.replace("$", "").replace(",", "").strip())
+            except ValueError:
+                return None
+        if isinstance(v, dict):
+            for k in ("amount", "value", "amount_usd"):
+                if k in v:
+                    return _coerce(v[k])
+        return None
+
+    flat_keys = (
+        "balance", "balance_usd", "available_balance",
+        "credit_balance", "credits_balance",
+        "available_credits", "available_credits_usd",
+        "remaining_credits", "remaining_credits_usd",
+        "amount_usd", "total_amount",
+    )
+    for k in flat_keys:
+        if k in data:
+            v = _coerce(data[k])
+            if v is not None:
+                return v
+    for nested_key in ("credits", "credit", "balance", "data", "result"):
+        if isinstance(data.get(nested_key), dict):
+            v = _parse_balance_usd(data[nested_key])
+            if v is not None:
+                return v
+    return None
+
+
+async def fetch_anthropic_balance(
+    org_id: str, session_cookie: str, tracker: BillingTracker
+) -> None:
+    """Pull current Anthropic prepaid credit balance via the console's internal API.
+
+    Requires a browser session cookie because the public/admin API doesn't expose
+    this. Cookie expires; on 401/403 we set anthropic_balance_error once and stop
+    until the daemon is restarted with a fresh cookie.
+    """
+    if tracker.state.anthropic_balance_error is not None:
+        return
+    if not org_id or not session_cookie:
+        return
+
+    url = f"https://platform.claude.com/api/organizations/{org_id}/prepaid/credits"
+    headers = {
+        "Cookie": session_cookie,
+        "Accept": "application/json",
+        "User-Agent": "costwatch/0.1",
+    }
+    timeout = httpx.Timeout(8.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code in (401, 403):
+                tracker.state.anthropic_balance_error = (
+                    "session cookie expired — refresh ANTHROPIC_SESSION_COOKIE"
+                )
+                tracker.state.anthropic_balance_usd = None
+                return
+            if r.status_code == 404:
+                tracker.state.anthropic_balance_error = "endpoint not found (check ANTHROPIC_ORG_ID)"
+                return
+            r.raise_for_status()
+            data = r.json()
+            balance = _parse_balance_usd(data)
+            if balance is None:
+                # Unknown response shape — log the top-level keys (not values)
+                # so we can adapt the parser.
+                shape = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+                log.info("Anthropic balance: could not parse response (top-level keys=%s)", shape)
+                tracker.state.anthropic_balance_error = "response shape not recognized"
+                return
+            tracker.state.anthropic_balance_usd = balance
+            tracker.state.anthropic_balance_error = None
+    except httpx.HTTPError as e:
+        log.debug("anthropic balance fetch failed: %s", e)
+        # Don't permanently disable on transient errors.
+
+
 # ── Anthropic Cost API (admin key required) ─────────────────────────────────
 
 async def fetch_anthropic_today_cost(admin_api_key: str, tracker: BillingTracker) -> Optional[float]:
@@ -226,6 +335,8 @@ async def billing_poller(
     interval_seconds: int = 60,
     stop: Optional[asyncio.Event] = None,
     include_gemini: bool = True,
+    anthropic_org_id: Optional[str] = None,
+    anthropic_session_cookie: Optional[str] = None,
 ):
     """Periodically refresh provider day-totals and call `on_update(state)`."""
 
@@ -239,6 +350,8 @@ async def billing_poller(
                 today = await fetch_anthropic_today_cost(anthropic_admin_key, tracker)
                 tracker.state.anthropic_today_usd = today
             coros.append(_anth())
+        if anthropic_org_id and anthropic_session_cookie:
+            coros.append(fetch_anthropic_balance(anthropic_org_id, anthropic_session_cookie, tracker))
         if openai_admin_key:
             async def _oai():
                 today = await fetch_openai_today_cost(openai_admin_key, tracker)

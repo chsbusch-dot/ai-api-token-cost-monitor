@@ -55,6 +55,8 @@ class BillingState:
     openai_today_usd: Optional[float] = None
     gemini_today_usd: Optional[float] = None
     # balance-style providers (USD remaining; drawdown = spend, computed once we persist)
+    anthropic_balance_usd: Optional[float] = None
+    anthropic_balance_error: Optional[str] = None  # human-readable hint when balance is unavailable
     deepgram_balance_usd: Optional[float] = None
     deepgram_error: Optional[str] = None  # set once if balance pull fails
 
@@ -84,6 +86,10 @@ class BillingState:
             "gemini_today_usd": (
                 round(self.gemini_today_usd, 4) if self.gemini_today_usd is not None else None
             ),
+            "anthropic_balance_usd": (
+                round(self.anthropic_balance_usd, 4) if self.anthropic_balance_usd is not None else None
+            ),
+            "anthropic_balance_error": self.anthropic_balance_error,
             "deepgram_balance_usd": (
                 round(self.deepgram_balance_usd, 4) if self.deepgram_balance_usd is not None else None
             ),

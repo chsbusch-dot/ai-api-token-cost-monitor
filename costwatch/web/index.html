@@ -60,6 +60,8 @@
       <div class="card a">
         <div class="label"><span class="dot"></span>anthropic</div>
         <div class="value" id="anthropic">—</div>
+        <div class="note">balance: <span id="anthropic_balance">—</span></div>
+        <div class="err" id="anthropic_balance_err"></div>
       </div>
       <div class="card o">
         <div class="label"><span class="dot"></span>openai</div>
@@ -116,6 +118,8 @@
       $("anthropic").textContent = fmtUSD(p.anthropic_today_usd);
       $("openai").textContent = fmtUSD(p.openai_today_usd);
       $("gemini").textContent = fmtUSD(p.gemini_today_usd);
+      $("anthropic_balance").textContent = fmtBal(p.anthropic_balance_usd);
+      $("anthropic_balance_err").textContent = p.anthropic_balance_error || "";
       $("deepgram").textContent = fmtBal(p.deepgram_balance_usd);
       $("deepgram_err").textContent = p.deepgram_error || "";
       $("ts").textContent = "updated " + new Date().toLocaleTimeString();

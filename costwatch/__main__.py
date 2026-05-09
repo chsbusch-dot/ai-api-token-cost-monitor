@@ -35,4 +35,8 @@ if __name__ == "__main__":
         port=port,
         log_level=os.getenv("UVICORN_LOG_LEVEL", "info"),
         access_log=False,
+        # Force-close lingering SSE/WebSocket connections after 5s on shutdown.
+        # Without this, an open dashboard tab will stall systemd restarts
+        # because SSE streams stay open indefinitely.
+        timeout_graceful_shutdown=5,
     )

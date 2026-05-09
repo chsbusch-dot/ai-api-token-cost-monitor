@@ -57,6 +57,8 @@ async def lifespan(app: FastAPI):
                 anthropic_admin_key=os.getenv("ANTHROPIC_ADMIN_API_KEY") or None,
                 openai_admin_key=os.getenv("OPENAI_ADMIN_API_KEY") or None,
                 deepgram_api_key=os.getenv("DEEPGRAM_ADMIN_API_KEY") or None,
+                anthropic_org_id=os.getenv("ANTHROPIC_ORG_ID") or None,
+                anthropic_session_cookie=os.getenv("ANTHROPIC_SESSION_COOKIE") or None,
                 on_update=on_update,
                 interval_seconds=int(os.getenv("POLL_INTERVAL_SECONDS", "60")),
                 stop=stop,
