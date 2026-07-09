@@ -13,13 +13,19 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from ..budgets import evaluate as evaluate_budgets
+from ..budgets import evaluate as evaluate_budgets, record_sent as record_alert_sent
 from ..core.billing import BillingTracker
 from ..core.billing_fetchers import billing_poller
 from ..digest import build_digest_payload, render_html, render_text
 from ..events import EventBus
 from ..mailer import MailError, send as send_mail
-from ..store import read_history, record_usage, write_snapshot
+from ..store import (
+    SPEND_PROVIDERS,
+    local_today_spend,
+    read_history,
+    record_usage,
+    write_snapshot,
+)
 
 WEB_DIR = Path(__file__).parent
 log = logging.getLogger("costwatch.web")
@@ -42,11 +48,28 @@ async def lifespan(app: FastAPI):
 
     async def on_update(state):
         write_snapshot(state)
-        await bus.publish(state.to_payload())
-        # Budget alerts (no-op if no BUDGET_* env vars configured)
+        # User-facing "today" is the LOCAL calendar day, reconstructed from
+        # snapshot deltas — the raw state fields are vendor UTC-day counters,
+        # which are wrong for display in any non-UTC timezone (at 18:00 PDT
+        # the UTC day is one hour old).
+        local_spend = {p: local_today_spend(p) for p in SPEND_PROVIDERS}
+        payload = state.to_payload()
+        for p in SPEND_PROVIDERS:
+            payload[f"{p}_today_usd"] = round(local_spend[p], 4)
+        payload["total_today_usd"] = round(sum(local_spend.values()), 4)
+        await bus.publish(payload)
+        # Budget alerts (no-op if no BUDGET_* env vars configured). The dedup
+        # record is written only after a successful send — SMTP hiccups retry
+        # on the next tick instead of permanently swallowing the alert.
         try:
-            for fire in evaluate_budgets(state):
-                _send_budget_alert(fire)
+            for fire in evaluate_budgets(local_spend):
+                try:
+                    _send_budget_alert(fire)
+                except Exception:
+                    log.exception("budget alert send failed (%s %s%%) — will retry next tick",
+                                  fire["provider"], fire["threshold_pct"])
+                else:
+                    record_alert_sent(fire)
         except Exception:
             log.exception("budget evaluation failed")
 

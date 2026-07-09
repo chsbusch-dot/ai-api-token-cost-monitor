@@ -16,6 +16,7 @@ ALLOWED_TOP_LEVEL_KEYS = {
     "session_seconds",
     "total_today_usd",
     "anthropic_today_usd",
+    "claude_code_today_usd",
     "openai_today_usd",
     "gemini_today_usd",
     "anthropic_balance_usd",

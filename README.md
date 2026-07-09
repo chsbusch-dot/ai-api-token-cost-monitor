@@ -188,16 +188,35 @@ scan on every push (`.github/workflows/ci.yml`).
 | `costwatch/ingest.py` | CLI for local-token reporting |
 | `systemd/*` | User-level service + 18:00 digest timer |
 
+## Reporting semantics
+
+All user-facing "today" figures — dashboard cards, chart bars, the digest
+email, and budget alerts — are the box's **local calendar day**. Vendor
+counters reset at UTC midnight, so local-day spend is reconstructed by
+summing deltas between consecutive snapshots (`store.daily_spend_series`).
+This matters: a digest fired at 18:00 PDT is 01:00 UTC the *next* day, and
+naively reading the vendor's "today" counter at that moment reports a
+1-hour-old UTC day (~$0) — the bug that shipped in v1.
+
 ## Limitations
 
+- **Subscription/OAuth Claude Code usage is invisible to the Admin API.**
+  Claude Code signed in with a Claude account (Pro/Max) bills the
+  subscription — it never appears in the org's usage/cost reports and is
+  not API spend. Claude Code usage billed to the org IS captured via the
+  Claude Code Analytics API (`/v1/organizations/usage_report/claude_code`,
+  polled every 15 min, ~1h data delay) and shows as the "claude code"
+  provider.
+- **Anthropic usage/cost Admin API is rate-limited to ~1 request/minute
+  sustained** — run exactly one poller. costwatch backs off 5 min on 429.
 - **Gemini today's spend is approximate** — local token tracking with the
-  pricing table; doesn't reflect Google's actual billing. Acceptable for
-  cost monitoring, not for accounting.
-- **Anthropic today's spend is approximate** — uses the Usage Report API
-  (~5 min freshness, current day) × local pricing table. The Cost Report
-  API would be exact but excludes today.
-- **Pricing table drift** — when a provider changes prices, you update
-  `PRICING_USD_PER_MTOK` in `costwatch/core/billing.py`.
+  pricing table; Google added AI Studio cost dashboards (Mar 2026) but
+  still no programmatic cost API for AI Studio keys.
+- **Anthropic today's spend is approximate** — Usage Report API × local
+  pricing table.
+- **Pricing table drift** — when a provider changes prices, update
+  `PRICING_USD_PER_MTOK` in `costwatch/core/billing.py` (last verified
+  2026-07-08).
 - **Single-user, no auth** — bind the dashboard to LAN-only or put it
   behind Tailscale / reverse-proxy auth. The `/admin/*` routes are
   loopback-only by code; non-admin routes are not.

@@ -10,13 +10,15 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from .core.billing import BillingState, PRICING_USD_PER_MTOK, DEFAULT_PRICE
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "costwatch.db"
+
+SPEND_PROVIDERS = ("anthropic", "claude_code", "openai", "gemini")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage_reports (
@@ -87,7 +89,14 @@ def record_usage(
 
 
 def write_snapshot(state: BillingState) -> int:
-    """Persist the current BillingState as one row per provider. Returns row count."""
+    """Persist the current BillingState as one row per provider. Returns row count.
+
+    Spend providers are written from `state.fresh_today` — the values actually
+    fetched THIS tick — never from the last-known display fields. A failed
+    fetch therefore produces a gap, not a stale row; gaps are harmless to the
+    delta-sum accounting below, whereas a stale cumulative counter carried
+    across UTC midnight would be double-counted as new-day spend.
+    """
     init()
     ts = int(time.time())
     by_model_json = (
@@ -97,13 +106,12 @@ def write_snapshot(state: BillingState) -> int:
         })
         if state.by_model else None
     )
+    fresh = getattr(state, "fresh_today", None) or {}
     rows: list[tuple[int, str, Optional[float], Optional[float], Optional[str]]] = []
-    if state.anthropic_today_usd is not None:
-        rows.append((ts, "anthropic", state.anthropic_today_usd, None, by_model_json))
-    if state.openai_today_usd is not None:
-        rows.append((ts, "openai", state.openai_today_usd, None, by_model_json))
-    if state.gemini_today_usd is not None:
-        rows.append((ts, "gemini", state.gemini_today_usd, None, by_model_json))
+    for prov in SPEND_PROVIDERS:
+        val = fresh.get(prov)
+        if val is not None:
+            rows.append((ts, prov, float(val), None, by_model_json))
     if state.deepgram_balance_usd is not None:
         rows.append((ts, "deepgram", None, state.deepgram_balance_usd, None))
 
@@ -118,41 +126,124 @@ def write_snapshot(state: BillingState) -> int:
     return len(rows)
 
 
-def read_history(days: int = 14) -> dict[str, Any]:
-    """Per-day per-provider totals for the last N UTC days (most recent snapshot wins)."""
+def _tzinfo(tz=None):
+    """Resolve the reporting timezone: explicit arg > system local zone."""
+    return tz or datetime.now().astimezone().tzinfo
+
+
+def spend_between(provider: str, start_ts: int, end_ts: int, now_ts: Optional[int] = None) -> float:
+    """True USD spend in [start_ts, end_ts) computed from snapshot deltas.
+
+    Vendor counters (`today_usd`) are cumulative within a UTC day and reset at
+    UTC midnight. Summing consecutive-snapshot deltas — treating a UTC-day
+    boundary as a reset — converts them into spend attributable to any
+    arbitrary window, e.g. a LOCAL calendar day. Robust to snapshot gaps
+    (delta across a gap within the same UTC day is exact) and to small
+    downward revisions (clamped to 0).
+    """
     init()
-    from datetime import timedelta
-    end = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    start = end - timedelta(days=days)
+    end_ts = min(end_ts, (now_ts or int(time.time())) + 1)
+    lookback = start_ts - 26 * 3600  # enough to find an anchor in the same UTC day
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT ts, today_usd FROM snapshots "
+            "WHERE provider = ? AND ts >= ? AND ts < ? AND today_usd IS NOT NULL "
+            "ORDER BY ts",
+            (provider, lookback, end_ts),
+        ).fetchall()
+    total = 0.0
+    prev_ts: Optional[int] = None
+    prev_val: Optional[float] = None
+    for ts, val in rows:
+        if prev_ts is not None and ts // 86400 == prev_ts // 86400:
+            delta = max(0.0, val - prev_val)
+        else:
+            # First snapshot ever, or first after UTC-midnight reset: the
+            # counter itself is the spend since the reset.
+            delta = max(0.0, val)
+        if ts >= start_ts:
+            total += delta
+        prev_ts, prev_val = ts, val
+    return total
+
+
+def daily_spend_series(
+    provider: str, days: int, tz=None, now_ts: Optional[int] = None
+) -> list[tuple[str, float]]:
+    """[(local_date, usd), ...] for the last `days` LOCAL calendar days,
+    oldest first; the final entry is today (partial). Days without spend are 0.0."""
+    init()
+    tzi = _tzinfo(tz)
+    now = datetime.fromtimestamp(now_ts, tzi) if now_ts else datetime.now(tzi)
+    first = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_ts = int(first.timestamp())
+    lookback = start_ts - 26 * 3600
+
+    totals: dict[str, float] = {}
+    for i in range(days):
+        totals[(first + timedelta(days=i)).strftime("%Y-%m-%d")] = 0.0
 
     with _conn() as c:
         rows = c.execute(
-            """
-            SELECT
-                strftime('%Y-%m-%d', ts, 'unixepoch') AS date,
-                provider, today_usd, balance_usd, ts
-            FROM snapshots
-            WHERE ts >= ? AND ts < ?
-            ORDER BY ts ASC
-            """,
-            (int(start.timestamp()), int(end.timestamp())),
+            "SELECT ts, today_usd FROM snapshots "
+            "WHERE provider = ? AND ts >= ? AND ts <= ? AND today_usd IS NOT NULL "
+            "ORDER BY ts",
+            (provider, lookback, int(now.timestamp())),
         ).fetchall()
 
-    # Fold to most-recent per (date, provider).
-    fold: dict[tuple[str, str], tuple[Optional[float], Optional[float]]] = {}
-    for date, provider, today, balance, _ts in rows:
-        fold[(date, provider)] = (today, balance)
+    prev_ts: Optional[int] = None
+    prev_val: Optional[float] = None
+    for ts, val in rows:
+        if prev_ts is not None and ts // 86400 == prev_ts // 86400:
+            delta = max(0.0, val - prev_val)
+        else:
+            delta = max(0.0, val)
+        if ts >= start_ts:
+            key = datetime.fromtimestamp(ts, tzi).strftime("%Y-%m-%d")
+            if key in totals:
+                totals[key] += delta
+        prev_ts, prev_val = ts, val
 
-    dates = sorted({d for (d, _) in fold})
+    return [(d, round(v, 6)) for d, v in totals.items()]
+
+
+def local_today_spend(provider: str, tz=None, now_ts: Optional[int] = None) -> float:
+    """USD spent so far during the current LOCAL calendar day."""
+    return daily_spend_series(provider, 1, tz=tz, now_ts=now_ts)[-1][1]
+
+
+def read_history(days: int = 14, tz=None) -> dict[str, Any]:
+    """Per-LOCAL-day per-provider spend for the last N days, plus the last
+    Deepgram balance reading of each day. Every day in the range is emitted."""
+    init()
+    tzi = _tzinfo(tz)
+    series_by_prov = {p: dict(daily_spend_series(p, days, tz=tzi)) for p in SPEND_PROVIDERS}
+    dates = list(next(iter(series_by_prov.values())).keys())
+
+    # Last Deepgram balance reading per local day.
+    first_ts = int(
+        (datetime.now(tzi) - timedelta(days=days - 1))
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .timestamp()
+    )
+    balances: dict[str, float] = {}
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT ts, balance_usd FROM snapshots "
+            "WHERE provider = 'deepgram' AND ts >= ? AND balance_usd IS NOT NULL ORDER BY ts",
+            (first_ts,),
+        ).fetchall()
+    for ts, bal in rows:
+        balances[datetime.fromtimestamp(ts, tzi).strftime("%Y-%m-%d")] = bal
+
     series = []
     for d in dates:
         entry: dict[str, Any] = {"date": d}
-        for prov in ("anthropic", "openai", "gemini"):
-            today, _ = fold.get((d, prov), (None, None))
-            entry[prov] = round(today, 4) if today is not None else 0.0
-        _, balance = fold.get((d, "deepgram"), (None, None))
-        entry["deepgram_balance"] = round(balance, 2) if balance is not None else None
-        entry["total_spend"] = round(entry["anthropic"] + entry["openai"] + entry["gemini"], 4)
+        for prov in SPEND_PROVIDERS:
+            entry[prov] = round(series_by_prov[prov].get(d, 0.0), 4)
+        bal = balances.get(d)
+        entry["deepgram_balance"] = round(bal, 2) if bal is not None else None
+        entry["total_spend"] = round(sum(entry[p] for p in SPEND_PROVIDERS), 4)
         series.append(entry)
 
     return {"days": days, "series": series}

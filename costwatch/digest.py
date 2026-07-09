@@ -1,52 +1,49 @@
-"""Build today's digest from snapshots + usage_reports."""
+"""Build today's digest from snapshots + usage_reports.
+
+All dates and "today" windows are the box's LOCAL calendar day — not UTC.
+The vendor counters in the snapshots table reset at UTC midnight, so spend
+per local day is reconstructed with delta-sum accounting (see
+store.daily_spend_series). This matters because the digest timer fires at
+18:00 local: in PDT that is 01:00 UTC of the NEXT day, and a UTC-based
+"today" would always be ~1 hour old and report ~$0.
+"""
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone, timedelta
-from typing import Any
+from datetime import datetime, timedelta
+from typing import Any, Optional
 
 from .core.billing import PRICING_USD_PER_MTOK, DEFAULT_PRICE
-from .store import _conn, init
+from .store import (
+    SPEND_PROVIDERS,
+    _conn,
+    _tzinfo,
+    daily_spend_series,
+    init,
+    latest_snapshots,
+)
 
 
 def _dashboard_url() -> str:
     return os.getenv("DASHBOARD_URL", "http://localhost:8000").rstrip("/")
 
 
-def build_digest_payload() -> dict[str, Any]:
-    """Today's spend per provider, vs. 7-day average + top model spend."""
-    init()
+def build_digest_payload(tz=None, now_ts: Optional[int] = None) -> dict[str, Any]:
+    """Local-day spend per provider vs. 7-full-day average + top model spend.
 
-    now = datetime.now(timezone.utc)
-    end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    today_start = end - timedelta(days=1)
-    week_start = end - timedelta(days=8)
+    `tz` / `now_ts` exist for deterministic tests; production uses the box's
+    local zone and the current time.
+    """
+    init()
+    tzi = _tzinfo(tz)
+    now = datetime.fromtimestamp(now_ts, tzi) if now_ts else datetime.now(tzi)
     today_str = now.strftime("%Y-%m-%d")
 
-    with _conn() as c:
-        rows = c.execute(
-            """
-            SELECT strftime('%Y-%m-%d', ts, 'unixepoch') AS d,
-                   provider, today_usd, balance_usd
-            FROM snapshots
-            WHERE ts >= ?
-            ORDER BY ts ASC
-            """,
-            (int(week_start.timestamp()),),
-        ).fetchall()
-
-    fold: dict[tuple[str, str], tuple[float | None, float | None]] = {}
-    for d, prov, today, balance in rows:
-        fold[(d, prov)] = (today, balance)
-
     by_provider: dict[str, dict[str, Any]] = {}
-    for prov in ("anthropic", "openai", "gemini"):
-        today_val = (fold.get((today_str, prov)) or (0.0, None))[0] or 0.0
-        prior = [
-            (fold.get((d, prov)) or (0.0, None))[0] or 0.0
-            for (d, p) in fold
-            if p == prov and d != today_str
-        ]
+    for prov in SPEND_PROVIDERS:
+        series = daily_spend_series(prov, 8, tz=tzi, now_ts=now_ts)
+        today_val = series[-1][1]            # today, partial
+        prior = [v for _d, v in series[:-1]]  # 7 full prior local days
         avg7 = (sum(prior) / len(prior)) if prior else 0.0
         delta_pct = ((today_val - avg7) / avg7 * 100) if avg7 > 0 else None
         by_provider[prov] = {
@@ -55,10 +52,11 @@ def build_digest_payload() -> dict[str, Any]:
             "delta_pct": round(delta_pct, 1) if delta_pct is not None else None,
         }
 
-    deepgram_balance = (fold.get((today_str, "deepgram")) or (None, None))[1]
+    snap = latest_snapshots().get("deepgram") or {}
+    deepgram_balance = snap.get("balance_usd")
 
-    # Top 5 spending models from local usage_reports today
-    today_unix = int(today_start.timestamp())
+    # Top 5 spending models from local usage_reports, since local midnight.
+    local_midnight = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     with _conn() as c:
         model_rows = c.execute(
             """
@@ -67,7 +65,7 @@ def build_digest_payload() -> dict[str, Any]:
             WHERE ts >= ?
             GROUP BY model
             """,
-            (today_unix,),
+            (local_midnight,),
         ).fetchall()
 
     top_models: list[tuple[str, float]] = []
@@ -84,6 +82,7 @@ def build_digest_payload() -> dict[str, Any]:
 
     return {
         "date": today_str,
+        "as_of": now.strftime("%H:%M %Z"),
         "total_today": total_today,
         "total_avg7": total_avg7,
         "by_provider": by_provider,
@@ -94,8 +93,11 @@ def build_digest_payload() -> dict[str, Any]:
 
 
 def render_text(p: dict[str, Any]) -> str:
+    header = f"costwatch — {p['date']}"
+    if p.get("as_of"):
+        header += f" (as of {p['as_of']})"
     L = [
-        f"costwatch — {p['date']}",
+        header,
         "",
         f"Total today:   ${p['total_today']:>9.4f}",
         f"7-day avg:     ${p['total_avg7']:>9.4f}",
@@ -159,7 +161,7 @@ def render_html(p: dict[str, Any]) -> str:
 
     return (
         '<html><body style="font-family:system-ui,-apple-system,sans-serif;color:#222;max-width:600px;margin:0 auto;padding:24px;">'
-        f'<p style="color:#666;margin:0;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;">costwatch · {p["date"]}</p>'
+        f'<p style="color:#666;margin:0;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;">costwatch · {p["date"]}{(" · as of " + p["as_of"]) if p.get("as_of") else ""}</p>'
         f'<h1 style="font-size:42px;margin:6px 0 4px;font-weight:700;letter-spacing:-0.02em;">${p["total_today"]:.4f}</h1>'
         '<p style="color:#666;margin-top:0;">total spent today</p>'
         '<table style="width:100%;border-collapse:collapse;margin-top:20px;font-size:14px;">'

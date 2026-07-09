@@ -10,23 +10,36 @@ log = logging.getLogger(__name__)
 
 
 # Per-million-token prices in USD. Conservative; defaults to Sonnet pricing for unknowns
-# so we don't under-report spend. Update as vendor pricing changes.
+# so we don't under-report spend. Last verified against vendor pricing pages: 2026-07-08.
 PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
-    # Anthropic Claude
+    # Anthropic Claude (Opus line repriced to $5/$25 in 2026)
     "claude-haiku-4-5-20251001": (1.00, 5.00),
     "claude-haiku-4-5": (1.00, 5.00),
     "claude-sonnet-4-6": (3.00, 15.00),
-    "claude-opus-4-7": (15.00, 75.00),
+    "claude-sonnet-5": (2.00, 10.00),         # intro pricing through 2026-08-31, then $3/$15
+    "claude-opus-4-6": (5.00, 25.00),
+    "claude-opus-4-7": (5.00, 25.00),
+    "claude-opus-4-8": (5.00, 25.00),
+    "claude-fable-5": (10.00, 50.00),
     # OpenAI
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.00),
     "gpt-5": (10.00, 30.00),
+    "gpt-5.1": (1.25, 10.00),
+    "gpt-5.4": (2.50, 15.00),
+    "gpt-5.4-mini": (0.75, 4.50),
+    "gpt-5.4-nano": (0.20, 1.25),
+    "gpt-5.5": (5.00, 30.00),
+    "gpt-5.5-pro": (30.00, 180.00),
     # Google Gemini
     "gemini-2.0-flash-exp": (0.0, 0.0),       # preview / free
     "gemini-2.0-flash": (0.10, 0.40),
     "gemini-2.5-flash-lite": (0.10, 0.40),
     "gemini-2.5-flash": (0.30, 2.50),
-    "gemini-2.5-pro": (1.25, 5.00),           # ≤200k context; >200k tier higher (not modeled)
+    "gemini-2.5-pro": (1.25, 10.00),          # output repriced $5→$10; ≤200k context tier
+    "gemini-3.1-flash-lite": (0.25, 1.50),
+    "gemini-3.1-pro-preview": (2.00, 12.00),
+    "gemini-3.5-flash": (1.50, 9.00),
     "gemini-1.5-flash": (0.075, 0.30),
     "gemini-1.5-flash-8b": (0.0375, 0.15),
     "gemini-1.5-pro": (1.25, 5.00),
@@ -54,11 +67,18 @@ class BillingState:
     anthropic_today_usd: Optional[float] = None
     openai_today_usd: Optional[float] = None
     gemini_today_usd: Optional[float] = None
+    # org-billed Claude Code usage (Anthropic Claude Code Analytics API, 2026)
+    claude_code_today_usd: Optional[float] = None
     # balance-style providers (USD remaining; drawdown = spend, computed once we persist)
     anthropic_balance_usd: Optional[float] = None
     anthropic_balance_error: Optional[str] = None  # human-readable hint when balance is unavailable
     deepgram_balance_usd: Optional[float] = None
     deepgram_error: Optional[str] = None  # set once if balance pull fails
+    # Values successfully fetched during the CURRENT poll tick, keyed by
+    # provider. write_snapshot persists only these — never the last-known
+    # display fields above — so failures leave gaps instead of stale rows.
+    # Not included in to_payload().
+    fresh_today: dict = field(default_factory=dict)
 
     def session_spend_usd(self) -> float:
         return sum(spend.cost_usd(model) for model, spend in self.by_model.items())
@@ -66,7 +86,10 @@ class BillingState:
     def total_today_usd(self) -> Optional[float]:
         """Sum of today's spend across spend-style providers. None if no provider reported."""
         parts = [
-            v for v in (self.anthropic_today_usd, self.openai_today_usd, self.gemini_today_usd)
+            v for v in (
+                self.anthropic_today_usd, self.openai_today_usd,
+                self.gemini_today_usd, self.claude_code_today_usd,
+            )
             if v is not None
         ]
         return round(sum(parts), 4) if parts else None
@@ -85,6 +108,9 @@ class BillingState:
             ),
             "gemini_today_usd": (
                 round(self.gemini_today_usd, 4) if self.gemini_today_usd is not None else None
+            ),
+            "claude_code_today_usd": (
+                round(self.claude_code_today_usd, 4) if self.claude_code_today_usd is not None else None
             ),
             "anthropic_balance_usd": (
                 round(self.anthropic_balance_usd, 4) if self.anthropic_balance_usd is not None else None

@@ -10,7 +10,7 @@
       --bg: #0e1116; --panel: #161a22; --border: #2a2f3a;
       --fg: #e6e6e6; --muted: #8a93a3; --accent: #4cc4ff;
       --good: #4ade80; --warn: #f5b942; --bad: #ff6b6b;
-      --anthropic: #d97757; --openai: #10a37f; --gemini: #4285f4; --deepgram: #ff3b8c;
+      --anthropic: #d97757; --claude-code: #8b5cf6; --openai: #10a37f; --gemini: #4285f4; --deepgram: #ff3b8c;
     }
     * { box-sizing: border-box; }
     body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif;
@@ -32,6 +32,7 @@
     .card .err { color: var(--bad); font-size: 13px; }
     .card .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
     .a .dot { background: var(--anthropic); }
+    .c .dot { background: var(--claude-code); }
     .o .dot { background: var(--openai); }
     .g .dot { background: var(--gemini); }
     .d .dot { background: var(--deepgram); }
@@ -62,6 +63,11 @@
         <div class="value" id="anthropic">—</div>
         <div class="note">balance: <span id="anthropic_balance">—</span></div>
         <div class="err" id="anthropic_balance_err"></div>
+      </div>
+      <div class="card c">
+        <div class="label"><span class="dot"></span>claude code</div>
+        <div class="value" id="claude_code">—</div>
+        <div class="note">org-billed Claude Code usage</div>
       </div>
       <div class="card o">
         <div class="label"><span class="dot"></span>openai</div>
@@ -116,6 +122,7 @@
       lastTickAt = Date.now();
       $("total").textContent = fmtUSD(p.total_today_usd);
       $("anthropic").textContent = fmtUSD(p.anthropic_today_usd);
+      $("claude_code").textContent = fmtUSD(p.claude_code_today_usd);
       $("openai").textContent = fmtUSD(p.openai_today_usd);
       $("gemini").textContent = fmtUSD(p.gemini_today_usd);
       $("anthropic_balance").textContent = fmtBal(p.anthropic_balance_usd);
@@ -142,14 +149,18 @@
 
     let chart = null;
     const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-    const colors = { anthropic: css("--anthropic"), openai: css("--openai"), gemini: css("--gemini") };
+    const SPEND_PROVIDERS = ["anthropic", "claude_code", "openai", "gemini"];
+    const colors = {
+      anthropic: css("--anthropic"), claude_code: css("--claude-code"),
+      openai: css("--openai"), gemini: css("--gemini"),
+    };
 
     async function loadChart() {
       const r = await fetch("/api/history?days=14");
       const j = await r.json();
       const labels = j.series.map(s => s.date);
       const dgColor = css("--deepgram");
-      const barDatasets = ["anthropic", "openai", "gemini"].map(prov => ({
+      const barDatasets = SPEND_PROVIDERS.map(prov => ({
         type: "bar", label: prov, backgroundColor: colors[prov], stack: "spend",
         data: j.series.map(s => s[prov] || 0), yAxisID: "y",
       }));
@@ -199,19 +210,31 @@
       });
     }
 
+    // Local calendar date as YYYY-MM-DD — matches the server's local-day
+    // history buckets. toISOString() would give the UTC date, which is
+    // tomorrow's date every evening west of Greenwich.
+    function localDateStr() {
+      const d = new Date();
+      const p = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+    }
+
     function updateTodayInChart(p) {
       if (!chart) return;
-      const today = new Date().toISOString().slice(0, 10);
+      const today = localDateStr();
       let idx = chart.data.labels.indexOf(today);
       if (idx === -1) {
         chart.data.labels.push(today);
         chart.data.datasets.forEach(ds => ds.data.push(ds.label === "deepgram balance" ? null : 0));
         idx = chart.data.labels.length - 1;
       }
-      chart.data.datasets[0].data[idx] = p.anthropic_today_usd ?? 0;
-      chart.data.datasets[1].data[idx] = p.openai_today_usd ?? 0;
-      chart.data.datasets[2].data[idx] = p.gemini_today_usd ?? 0;
-      chart.data.datasets[3].data[idx] = p.deepgram_balance_usd ?? null;
+      for (const ds of chart.data.datasets) {
+        if (ds.label === "deepgram balance") {
+          ds.data[idx] = p.deepgram_balance_usd ?? null;
+        } else {
+          ds.data[idx] = p[`${ds.label}_today_usd`] ?? 0;
+        }
+      }
       chart.update("none");
     }
 

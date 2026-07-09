@@ -44,6 +44,6 @@ def test_history_endpoint_returns_only_safe_fields(client):
     assert "series" in body
     for entry in body["series"]:
         # No surprise fields that could carry creds
-        allowed = {"date", "anthropic", "openai", "gemini",
+        allowed = {"date", "anthropic", "claude_code", "openai", "gemini",
                    "deepgram_balance", "total_spend"}
         assert set(entry.keys()) <= allowed

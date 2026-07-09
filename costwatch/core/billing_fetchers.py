@@ -1,8 +1,18 @@
-"""External cost fetchers. All async, all degrade gracefully on auth/scope errors."""
+"""External cost fetchers. All async, all degrade gracefully on auth/scope errors.
+
+Failure policy (uniform across fetchers):
+  - Transient errors (network, 5xx) → return None; caller keeps last value.
+  - 429 → short cooldown (RATE_LIMIT_COOLDOWN_S) before the next attempt.
+  - Auth/scope/config errors (400/401/403/404) → hourly retry cooldown, NOT a
+    permanent disable — a long-running daemon must survive vendor incidents
+    and key rotations without a restart.
+Cooldowns are stored as `_<name>_retry_at` epoch attrs on the tracker state.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -12,6 +22,17 @@ from .billing import BillingTracker, PRICING_USD_PER_MTOK, DEFAULT_PRICE
 
 log = logging.getLogger(__name__)
 
+RATE_LIMIT_COOLDOWN_S = 300   # after a 429
+AUTH_RETRY_COOLDOWN_S = 3600  # after 400/401/403/404
+
+
+def _in_cooldown(state, attr: str) -> bool:
+    return time.time() < (getattr(state, attr, 0) or 0)
+
+
+def _set_cooldown(state, attr: str, seconds: float) -> None:
+    setattr(state, attr, time.time() + seconds)
+
 
 # ── Deepgram (prepaid balance) ───────────────────────────────────────────────
 
@@ -19,11 +40,11 @@ async def fetch_deepgram_balance(api_key: str, tracker: BillingTracker) -> None:
     """Read remaining USD balance from the user's first Deepgram project.
 
     Requires the key to have `billing:read` scope (Member or Owner role, not
-    the default listen-only key). On 403 we record the error once and stop
-    trying — the user fixes it by swapping in a properly-scoped key.
+    the default listen-only key). Auth/scope failures set a user-visible error
+    and retry hourly.
     """
-    if tracker.state.deepgram_error is not None:
-        return  # already determined this key can't read balance — don't keep trying
+    if _in_cooldown(tracker.state, "_deepgram_retry_at"):
+        return
 
     if not api_key:
         return
@@ -35,6 +56,10 @@ async def fetch_deepgram_balance(api_key: str, tracker: BillingTracker) -> None:
             r = await client.get("https://api.deepgram.com/v1/projects", headers=headers)
             if r.status_code == 401:
                 tracker.set_deepgram_error("auth failed (check DEEPGRAM_ADMIN_API_KEY)")
+                _set_cooldown(tracker.state, "_deepgram_retry_at", AUTH_RETRY_COOLDOWN_S)
+                return
+            if r.status_code == 429:
+                _set_cooldown(tracker.state, "_deepgram_retry_at", RATE_LIMIT_COOLDOWN_S)
                 return
             r.raise_for_status()
             projects = r.json().get("projects", [])
@@ -56,6 +81,7 @@ async def fetch_deepgram_balance(api_key: str, tracker: BillingTracker) -> None:
                     "Fix: console.deepgram.com → API Keys → create new key with "
                     "Member or Owner role, then update DEEPGRAM_ADMIN_API_KEY."
                 )
+                _set_cooldown(tracker.state, "_deepgram_retry_at", AUTH_RETRY_COOLDOWN_S)
                 return
             r.raise_for_status()
             balances = r.json().get("balances", [])
@@ -135,10 +161,10 @@ async def fetch_anthropic_balance(
     """Pull current Anthropic prepaid credit balance via the console's internal API.
 
     Requires a browser session cookie because the public/admin API doesn't expose
-    this. Cookie expires; on 401/403 we set anthropic_balance_error once and stop
-    until the daemon is restarted with a fresh cookie.
+    this. Cookie expires; on 401/403 we set anthropic_balance_error and retry
+    hourly (the error clears automatically once a working cookie is in place).
     """
-    if tracker.state.anthropic_balance_error is not None:
+    if _in_cooldown(tracker.state, "_anth_balance_retry_at"):
         return
     if not org_id or not session_cookie:
         return
@@ -158,9 +184,14 @@ async def fetch_anthropic_balance(
                     "session cookie expired — refresh ANTHROPIC_SESSION_COOKIE"
                 )
                 tracker.state.anthropic_balance_usd = None
+                _set_cooldown(tracker.state, "_anth_balance_retry_at", AUTH_RETRY_COOLDOWN_S)
                 return
             if r.status_code == 404:
                 tracker.state.anthropic_balance_error = "endpoint not found (check ANTHROPIC_ORG_ID)"
+                _set_cooldown(tracker.state, "_anth_balance_retry_at", AUTH_RETRY_COOLDOWN_S)
+                return
+            if r.status_code == 429:
+                _set_cooldown(tracker.state, "_anth_balance_retry_at", RATE_LIMIT_COOLDOWN_S)
                 return
             r.raise_for_status()
             data = r.json()
@@ -194,7 +225,7 @@ async def fetch_anthropic_today_cost(admin_api_key: str, tracker: BillingTracker
       - An Admin API key (`sk-ant-admin...`)
       - Account is part of an organization (individual accounts can't use this)
     """
-    if getattr(tracker.state, "_anthropic_admin_disabled", False):
+    if _in_cooldown(tracker.state, "_anthropic_usage_retry_at"):
         return None
 
     now = datetime.now(timezone.utc)
@@ -221,13 +252,17 @@ async def fetch_anthropic_today_cost(admin_api_key: str, tracker: BillingTracker
                 params=params,
                 headers=headers,
             )
+            if r.status_code == 429:
+                log.info("Anthropic usage API rate-limited (429) — cooling down %ds", RATE_LIMIT_COOLDOWN_S)
+                _set_cooldown(tracker.state, "_anthropic_usage_retry_at", RATE_LIMIT_COOLDOWN_S)
+                return None
             if r.status_code in (400, 401, 403, 404):
                 body = r.text[:300] if r.text else "(no body)"
                 log.info(
-                    "Anthropic Cost API unavailable (status=%d) — disabling. body=%s",
-                    r.status_code, body,
+                    "Anthropic usage API unavailable (status=%d) — retrying in %ds. body=%s",
+                    r.status_code, AUTH_RETRY_COOLDOWN_S, body,
                 )
-                setattr(tracker.state, "_anthropic_admin_disabled", True)
+                _set_cooldown(tracker.state, "_anthropic_usage_retry_at", AUTH_RETRY_COOLDOWN_S)
                 return None
             r.raise_for_status()
             data = r.json()
@@ -274,6 +309,84 @@ def _compute_today_cost_from_usage(data: dict) -> float:
     return total_usd
 
 
+# ── Anthropic Claude Code Analytics API (admin key required; added 2026) ────
+
+CLAUDE_CODE_POLL_INTERVAL_S = 900  # data is daily-aggregated with ~1h delay — no point polling faster
+
+
+def _sum_claude_code_costs(pages: list[dict]) -> float:
+    """Sum estimated_cost across all actors/models in a day's report pages.
+
+    Response shape (docs, verified 2026-07): data[].model_breakdown[].estimated_cost
+    = {"amount": <minor units, e.g. cents>, "currency": "USD"}.
+    """
+    total_minor = 0.0
+    for page in pages:
+        for record in page.get("data", []):
+            for mb in record.get("model_breakdown", []) or []:
+                cost = mb.get("estimated_cost") or {}
+                amount = cost.get("amount")
+                if isinstance(amount, (int, float)) and (cost.get("currency") or "USD").upper() == "USD":
+                    total_minor += float(amount)
+    return total_minor / 100.0
+
+
+async def fetch_claude_code_today_cost(admin_api_key: str, tracker: BillingTracker) -> Optional[float]:
+    """Today's (UTC) org-billed Claude Code spend via the Claude Code Analytics API.
+
+    GET /v1/organizations/usage_report/claude_code?starting_at=YYYY-MM-DD
+    Covers Claude Code usage attributed to the org (both api and subscription
+    customer types per the schema). Daily granularity, ~1h data delay — polled
+    at most every CLAUDE_CODE_POLL_INTERVAL_S regardless of tick cadence.
+    """
+    if _in_cooldown(tracker.state, "_claude_code_retry_at"):
+        return None
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    headers = {
+        "anthropic-version": "2023-06-01",
+        "x-api-key": admin_api_key,
+        "User-Agent": "costwatch/0.1",
+    }
+    timeout = httpx.Timeout(10.0)
+    pages: list[dict] = []
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            page_token: Optional[str] = None
+            for _ in range(10):  # pagination safety bound
+                params: list[tuple[str, str]] = [("starting_at", today), ("limit", "1000")]
+                if page_token:
+                    params.append(("page", page_token))
+                r = await client.get(
+                    "https://api.anthropic.com/v1/organizations/usage_report/claude_code",
+                    params=params,
+                    headers=headers,
+                )
+                if r.status_code == 429:
+                    _set_cooldown(tracker.state, "_claude_code_retry_at", RATE_LIMIT_COOLDOWN_S)
+                    return None
+                if r.status_code in (400, 401, 403, 404):
+                    log.info(
+                        "Claude Code Analytics API unavailable (status=%d) — retrying in %ds",
+                        r.status_code, AUTH_RETRY_COOLDOWN_S,
+                    )
+                    _set_cooldown(tracker.state, "_claude_code_retry_at", AUTH_RETRY_COOLDOWN_S)
+                    return None
+                r.raise_for_status()
+                body = r.json()
+                pages.append(body)
+                if not body.get("has_more"):
+                    break
+                page_token = body.get("next_page")
+                if not page_token:
+                    break
+        _set_cooldown(tracker.state, "_claude_code_retry_at", CLAUDE_CODE_POLL_INTERVAL_S)
+        return _sum_claude_code_costs(pages)
+    except httpx.HTTPError as e:
+        log.debug("claude code usage fetch failed: %s", e)
+        return None
+
+
 # ── OpenAI Cost API (admin key required) ────────────────────────────────────
 
 async def fetch_openai_today_cost(admin_api_key: str, tracker: BillingTracker) -> Optional[float]:
@@ -284,7 +397,7 @@ async def fetch_openai_today_cost(admin_api_key: str, tracker: BillingTracker) -
         Organization → Admin keys (org owner only).
       - Account is part of an organization.
     """
-    if getattr(tracker.state, "_openai_admin_disabled", False):
+    if _in_cooldown(tracker.state, "_openai_cost_retry_at"):
         return None
 
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -302,12 +415,16 @@ async def fetch_openai_today_cost(admin_api_key: str, tracker: BillingTracker) -
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.get(url, headers=headers)
+            if r.status_code == 429:
+                log.info("OpenAI cost API rate-limited (429) — cooling down %ds", RATE_LIMIT_COOLDOWN_S)
+                _set_cooldown(tracker.state, "_openai_cost_retry_at", RATE_LIMIT_COOLDOWN_S)
+                return None
             if r.status_code in (401, 403, 404):
                 log.info(
-                    "OpenAI Cost API unavailable (status=%d) — disabling.",
-                    r.status_code,
+                    "OpenAI Cost API unavailable (status=%d) — retrying in %ds.",
+                    r.status_code, AUTH_RETRY_COOLDOWN_S,
                 )
-                setattr(tracker.state, "_openai_admin_disabled", True)
+                _set_cooldown(tracker.state, "_openai_cost_retry_at", AUTH_RETRY_COOLDOWN_S)
                 return None
             r.raise_for_status()
             data = r.json()
@@ -344,18 +461,34 @@ async def billing_poller(
     from ..store import today_usd_by_provider
 
     async def tick():
+        # Values actually fetched THIS tick. write_snapshot persists only these,
+        # so a failed fetch produces a snapshot gap (harmless to delta-sum
+        # accounting) instead of a stale counter row. The display fields on
+        # state keep their last-known value across transient failures.
+        fresh: dict[str, float] = {}
         coros = []
         if anthropic_admin_key:
             async def _anth():
                 today = await fetch_anthropic_today_cost(anthropic_admin_key, tracker)
-                tracker.state.anthropic_today_usd = today
+                if today is not None:
+                    tracker.state.anthropic_today_usd = today
+                    fresh["anthropic"] = today
             coros.append(_anth())
+
+            async def _cc():
+                today = await fetch_claude_code_today_cost(anthropic_admin_key, tracker)
+                if today is not None:
+                    tracker.state.claude_code_today_usd = today
+                    fresh["claude_code"] = today
+            coros.append(_cc())
         if anthropic_org_id and anthropic_session_cookie:
             coros.append(fetch_anthropic_balance(anthropic_org_id, anthropic_session_cookie, tracker))
         if openai_admin_key:
             async def _oai():
                 today = await fetch_openai_today_cost(openai_admin_key, tracker)
-                tracker.state.openai_today_usd = today
+                if today is not None:
+                    tracker.state.openai_today_usd = today
+                    fresh["openai"] = today
             coros.append(_oai())
         if deepgram_api_key:
             coros.append(fetch_deepgram_balance(deepgram_api_key, tracker))
@@ -364,16 +497,31 @@ async def billing_poller(
         if include_gemini:
             # Synchronous SQLite read — fast (single indexed query). Run in default
             # executor to keep the loop unblocked under load.
-            loop = asyncio.get_running_loop()
-            tracker.state.gemini_today_usd = await loop.run_in_executor(
-                None, today_usd_by_provider, "gemini"
-            )
+            try:
+                loop = asyncio.get_running_loop()
+                gem = await loop.run_in_executor(None, today_usd_by_provider, "gemini")
+                tracker.state.gemini_today_usd = gem
+                fresh["gemini"] = gem
+            except Exception:
+                log.exception("gemini local rollup failed")
+        tracker.state.fresh_today = fresh
         try:
             await on_update(tracker.state)
         except Exception:
-            log.debug("on_update failed", exc_info=True)
+            log.exception("on_update failed")
 
-    await tick()
+    async def guarded_tick():
+        # The poller must outlive any single bad tick — an unhandled exception
+        # here would silently kill the polling task while the web server keeps
+        # serving stale data.
+        try:
+            await tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("poll tick failed")
+
+    await guarded_tick()
     while True:
         try:
             if stop is not None and stop.is_set():
@@ -381,7 +529,7 @@ async def billing_poller(
             await asyncio.sleep(interval_seconds)
         except asyncio.CancelledError:
             return
-        await tick()
+        await guarded_tick()
 
 
 # ── Smoke test (step 1 deliverable) ─────────────────────────────────────────
