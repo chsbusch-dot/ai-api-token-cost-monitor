@@ -212,14 +212,20 @@ async def fetch_anthropic_balance(
 
 # ── Anthropic Cost API (admin key required) ─────────────────────────────────
 
-async def fetch_anthropic_today_cost(admin_api_key: str, tracker: BillingTracker) -> Optional[float]:
+async def fetch_anthropic_today_cost(
+    admin_api_key: str, tracker: BillingTracker
+) -> Optional[tuple[float, dict[Optional[str], float]]]:
     """Estimate today's (UTC) Anthropic spend via the Usage Report API.
 
-    The Cost Report API excludes the current day, so we use the Usage Report
-    (which supports 1h granularity and live data with ~5min freshness), then
-    multiply token counts by our local pricing table. Less accurate than the
-    Cost API for past days (no cache/batch discount adjustments), but gives a
-    live current-day signal.
+    Returns (total_usd, usd_by_api_key_id) — one request grouped by
+    model + api_key_id serves both the headline total and per-key attribution
+    without extra rate-limit cost. None on failure/cooldown.
+
+    We use the Usage Report (1h granularity, ~5min freshness) and multiply
+    token counts by our local pricing table. Less accurate than the Cost
+    Report for past days (no batch/discount adjustments), but live — and it
+    is the only surface that attributes to individual API keys (the Cost
+    Report only groups by workspace).
 
     Requires:
       - An Admin API key (`sk-ant-admin...`)
@@ -238,6 +244,7 @@ async def fetch_anthropic_today_cost(admin_api_key: str, tracker: BillingTracker
         ("ending_at", ending.isoformat().replace("+00:00", "Z")),
         ("bucket_width", "1h"),
         ("group_by[]", "model"),
+        ("group_by[]", "api_key_id"),
     ]
     headers = {
         "anthropic-version": "2023-06-01",
@@ -280,33 +287,93 @@ CACHE_READ_MULT = 0.1
 WEB_SEARCH_USD_PER_REQUEST = 0.01
 
 
-def _compute_today_cost_from_usage(data: dict) -> float:
-    """Sum per-model token usage across all buckets and apply pricing locally."""
+def _usage_row_cost_usd(r: dict) -> float:
+    """Estimated USD cost of one usage-report result row (tokens × pricing)."""
+    model = r.get("model") or ""
+    in_price, out_price = PRICING_USD_PER_MTOK.get(model, DEFAULT_PRICE)
+
+    uncached_in = r.get("uncached_input_tokens") or 0
+    cache_read = r.get("cache_read_input_tokens") or 0
+    cache_create = r.get("cache_creation") or {}
+    cache_5m = cache_create.get("ephemeral_5m_input_tokens") or 0
+    cache_1h = cache_create.get("ephemeral_1h_input_tokens") or 0
+    output = r.get("output_tokens") or 0
+    web_search = (r.get("server_tool_use") or {}).get("web_search_requests") or 0
+
+    input_cost = (
+        uncached_in
+        + cache_read * CACHE_READ_MULT
+        + cache_5m * CACHE_WRITE_5M_MULT
+        + cache_1h * CACHE_WRITE_1H_MULT
+    ) * in_price / 1_000_000
+    output_cost = output * out_price / 1_000_000
+    tool_cost = web_search * WEB_SEARCH_USD_PER_REQUEST
+    return input_cost + output_cost + tool_cost
+
+
+def _compute_today_cost_from_usage(data: dict) -> tuple[float, dict[Optional[str], float]]:
+    """Sum usage across all buckets → (total_usd, usd_by_api_key_id).
+
+    Rows carry api_key_id when the request was grouped by it; rows without one
+    (Workbench/Console traffic) accumulate under key None.
+    """
     total_usd = 0.0
+    by_key: dict[Optional[str], float] = {}
     for bucket in data.get("data", []):
         for r in bucket.get("results", []):
-            model = r.get("model") or ""
-            in_price, out_price = PRICING_USD_PER_MTOK.get(model, DEFAULT_PRICE)
+            usd = _usage_row_cost_usd(r)
+            total_usd += usd
+            kid = r.get("api_key_id")
+            by_key[kid] = by_key.get(kid, 0.0) + usd
+    return total_usd, by_key
 
-            uncached_in = r.get("uncached_input_tokens") or 0
-            cache_read = r.get("cache_read_input_tokens") or 0
-            cache_create = r.get("cache_creation") or {}
-            cache_5m = cache_create.get("ephemeral_5m_input_tokens") or 0
-            cache_1h = cache_create.get("ephemeral_1h_input_tokens") or 0
-            output = r.get("output_tokens") or 0
-            web_search = (r.get("server_tool_use") or {}).get("web_search_requests") or 0
 
-            input_cost = (
-                uncached_in
-                + cache_read * CACHE_READ_MULT
-                + cache_5m * CACHE_WRITE_5M_MULT
-                + cache_1h * CACHE_WRITE_1H_MULT
-            ) * in_price / 1_000_000
-            output_cost = output * out_price / 1_000_000
-            tool_cost = web_search * WEB_SEARCH_USD_PER_REQUEST
+# ── Anthropic API key name resolution (for attribution labels) ──────────────
 
-            total_usd += input_cost + output_cost + tool_cost
-    return total_usd
+KEY_NAME_CACHE_TTL_S = 3600
+
+
+async def get_anthropic_key_names(admin_api_key: str, tracker: BillingTracker) -> dict[str, str]:
+    """{api_key_id: key_name} for the org, cached in-memory for 1h.
+    Returns the stale cache (or {}) on fetch failure."""
+    cache = getattr(tracker.state, "_anth_key_names", None)
+    cached_at = getattr(tracker.state, "_anth_key_names_at", 0) or 0
+    if cache is not None and time.time() - cached_at < KEY_NAME_CACHE_TTL_S:
+        return cache
+
+    headers = {
+        "anthropic-version": "2023-06-01",
+        "x-api-key": admin_api_key,
+        "User-Agent": "costwatch/0.1",
+    }
+    mapping: dict[str, str] = {}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+            page: Optional[str] = None
+            for _ in range(10):
+                params: list[tuple[str, str]] = [("limit", "100")]
+                if page:
+                    params.append(("after_id", page))
+                r = await client.get(
+                    "https://api.anthropic.com/v1/organizations/api_keys",
+                    params=params, headers=headers,
+                )
+                if r.status_code != 200:
+                    return cache or {}
+                body = r.json()
+                for k in body.get("data", []):
+                    if k.get("id"):
+                        mapping[k["id"]] = k.get("name") or k["id"]
+                if not body.get("has_more"):
+                    break
+                page = body.get("last_id")
+                if not page:
+                    break
+        setattr(tracker.state, "_anth_key_names", mapping)
+        setattr(tracker.state, "_anth_key_names_at", time.time())
+        return mapping
+    except httpx.HTTPError:
+        return cache or {}
 
 
 # ── Anthropic Claude Code Analytics API (admin key required; added 2026) ────
@@ -389,8 +456,27 @@ async def fetch_claude_code_today_cost(admin_api_key: str, tracker: BillingTrack
 
 # ── OpenAI Cost API (admin key required) ────────────────────────────────────
 
-async def fetch_openai_today_cost(admin_api_key: str, tracker: BillingTracker) -> Optional[float]:
-    """Pull total USD cost for the current UTC day via OpenAI's organization costs endpoint.
+def _sum_openai_costs(data: dict) -> tuple[float, dict[Optional[str], float]]:
+    """(total_usd, usd_by_project_id) from a costs response grouped by project_id."""
+    total_usd = 0.0
+    by_project: dict[Optional[str], float] = {}
+    for bucket in data.get("data", []):
+        for result in bucket.get("results", []):
+            amount = result.get("amount") or {}
+            val = amount.get("value")
+            if isinstance(val, (int, float)):
+                total_usd += float(val)
+                pid = result.get("project_id")
+                by_project[pid] = by_project.get(pid, 0.0) + float(val)
+    return total_usd, by_project
+
+
+async def fetch_openai_today_cost(
+    admin_api_key: str, tracker: BillingTracker
+) -> Optional[tuple[float, dict[Optional[str], float]]]:
+    """Pull today's (UTC) USD cost via OpenAI's organization costs endpoint,
+    grouped by project — one request serves both the total (sum) and
+    per-project attribution.
 
     Requires:
       - An Admin API key (`sk-admin-...`), generated at platform.openai.com →
@@ -406,6 +492,7 @@ async def fetch_openai_today_cost(admin_api_key: str, tracker: BillingTracker) -
     url = (
         f"https://api.openai.com/v1/organization/costs"
         f"?start_time={start}&end_time={end}&bucket_width=1d&limit=31"
+        f"&group_by=project_id"
     )
     headers = {
         "Authorization": f"Bearer {admin_api_key}",
@@ -427,18 +514,49 @@ async def fetch_openai_today_cost(admin_api_key: str, tracker: BillingTracker) -
                 _set_cooldown(tracker.state, "_openai_cost_retry_at", AUTH_RETRY_COOLDOWN_S)
                 return None
             r.raise_for_status()
-            data = r.json()
-            total_usd = 0.0
-            for bucket in data.get("data", []):
-                for result in bucket.get("results", []):
-                    amount = result.get("amount") or {}
-                    val = amount.get("value")
-                    if isinstance(val, (int, float)):
-                        total_usd += float(val)
-            return total_usd
+            return _sum_openai_costs(r.json())
     except httpx.HTTPError as e:
         log.debug("openai cost fetch failed: %s", e)
         return None
+
+
+async def get_openai_project_names(admin_api_key: str, tracker: BillingTracker) -> dict[str, str]:
+    """{project_id: name} for the org, cached in-memory for 1h.
+    Returns the stale cache (or {}) on fetch failure."""
+    cache = getattr(tracker.state, "_openai_proj_names", None)
+    cached_at = getattr(tracker.state, "_openai_proj_names_at", 0) or 0
+    if cache is not None and time.time() - cached_at < KEY_NAME_CACHE_TTL_S:
+        return cache
+
+    headers = {"Authorization": f"Bearer {admin_api_key}", "User-Agent": "costwatch/0.1"}
+    mapping: dict[str, str] = {}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+            after: Optional[str] = None
+            for _ in range(10):
+                params: list[tuple[str, str]] = [("limit", "100")]
+                if after:
+                    params.append(("after", after))
+                r = await client.get(
+                    "https://api.openai.com/v1/organization/projects",
+                    params=params, headers=headers,
+                )
+                if r.status_code != 200:
+                    return cache or {}
+                body = r.json()
+                for p in body.get("data", []):
+                    if p.get("id"):
+                        mapping[p["id"]] = p.get("name") or p["id"]
+                if not body.get("has_more"):
+                    break
+                after = body.get("last_id")
+                if not after:
+                    break
+        setattr(tracker.state, "_openai_proj_names", mapping)
+        setattr(tracker.state, "_openai_proj_names_at", time.time())
+        return mapping
+    except httpx.HTTPError:
+        return cache or {}
 
 
 # ── Polling loop ─────────────────────────────────────────────────────────────
@@ -458,7 +576,7 @@ async def billing_poller(
     """Periodically refresh provider day-totals and call `on_update(state)`."""
 
     # Lazy import — avoids forcing SQLite init at module import time.
-    from ..store import today_usd_by_provider
+    from ..store import today_usd_by_gemini_source, today_usd_by_provider
 
     async def tick():
         # Values actually fetched THIS tick. write_snapshot persists only these,
@@ -466,13 +584,21 @@ async def billing_poller(
         # accounting) instead of a stale counter row. The display fields on
         # state keep their last-known value across transient failures.
         fresh: dict[str, float] = {}
+        fresh_sources: dict[str, float] = {}
         coros = []
         if anthropic_admin_key:
             async def _anth():
-                today = await fetch_anthropic_today_cost(anthropic_admin_key, tracker)
-                if today is not None:
-                    tracker.state.anthropic_today_usd = today
-                    fresh["anthropic"] = today
+                res = await fetch_anthropic_today_cost(anthropic_admin_key, tracker)
+                if res is not None:
+                    total, by_key = res
+                    tracker.state.anthropic_today_usd = total
+                    fresh["anthropic"] = total
+                    names = await get_anthropic_key_names(anthropic_admin_key, tracker)
+                    for kid, usd in by_key.items():
+                        label = names.get(kid) or (kid if kid else "console")
+                        fresh_sources[f"anthropic:{label}"] = (
+                            fresh_sources.get(f"anthropic:{label}", 0.0) + usd
+                        )
             coros.append(_anth())
 
             async def _cc():
@@ -485,10 +611,17 @@ async def billing_poller(
             coros.append(fetch_anthropic_balance(anthropic_org_id, anthropic_session_cookie, tracker))
         if openai_admin_key:
             async def _oai():
-                today = await fetch_openai_today_cost(openai_admin_key, tracker)
-                if today is not None:
-                    tracker.state.openai_today_usd = today
-                    fresh["openai"] = today
+                res = await fetch_openai_today_cost(openai_admin_key, tracker)
+                if res is not None:
+                    total, by_project = res
+                    tracker.state.openai_today_usd = total
+                    fresh["openai"] = total
+                    names = await get_openai_project_names(openai_admin_key, tracker)
+                    for pid, usd in by_project.items():
+                        label = names.get(pid) or (pid if pid else "default")
+                        fresh_sources[f"openai:{label}"] = (
+                            fresh_sources.get(f"openai:{label}", 0.0) + usd
+                        )
             coros.append(_oai())
         if deepgram_api_key:
             coros.append(fetch_deepgram_balance(deepgram_api_key, tracker))
@@ -502,9 +635,13 @@ async def billing_poller(
                 gem = await loop.run_in_executor(None, today_usd_by_provider, "gemini")
                 tracker.state.gemini_today_usd = gem
                 fresh["gemini"] = gem
+                by_source = await loop.run_in_executor(None, today_usd_by_gemini_source)
+                for src, usd in by_source.items():
+                    fresh_sources[f"gemini:{src}"] = usd
             except Exception:
                 log.exception("gemini local rollup failed")
         tracker.state.fresh_today = fresh
+        tracker.state.fresh_sources = fresh_sources
         try:
             await on_update(tracker.state)
         except Exception:
@@ -559,15 +696,19 @@ if __name__ == "__main__":
         labels = []
         if anth_key:
             async def _anth():
-                v = await fetch_anthropic_today_cost(anth_key, tracker)
-                tracker.state.anthropic_today_usd = v
-                return v
+                res = await fetch_anthropic_today_cost(anth_key, tracker)
+                if res is not None:
+                    tracker.state.anthropic_today_usd = res[0]
+                    return res[0]
+                return None
             tasks.append(_anth()); labels.append("anthropic_spend")
         if oai_key:
             async def _oai():
-                v = await fetch_openai_today_cost(oai_key, tracker)
-                tracker.state.openai_today_usd = v
-                return v
+                res = await fetch_openai_today_cost(oai_key, tracker)
+                if res is not None:
+                    tracker.state.openai_today_usd = res[0]
+                    return res[0]
+                return None
             tasks.append(_oai()); labels.append("openai_spend")
         if dg_key:
             tasks.append(fetch_deepgram_balance(dg_key, tracker))

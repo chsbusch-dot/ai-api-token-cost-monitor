@@ -91,6 +91,14 @@
       <div style="position:relative;height:280px;"><canvas id="chart"></canvas></div>
     </div>
 
+    <div class="models" id="apps_section" style="display:none">
+      <h1>by app (today / 14 days, local)</h1>
+      <table>
+        <thead><tr><th>source</th><th class="r">today</th><th class="r">14d</th></tr></thead>
+        <tbody id="apps"></tbody>
+      </table>
+    </div>
+
     <div class="models">
       <h1>by model (current process)</h1>
       <table>
@@ -250,10 +258,35 @@
       if (lastTickAt && Date.now() - lastTickAt > 90000) setConn("stale");
     }, 5000);
 
+    async function loadAttribution() {
+      try {
+        const r = await fetch("/api/attribution?days=14");
+        const j = await r.json();
+        const rows = (j.sources || []).filter(s => s.total > 0);
+        const section = $("apps_section");
+        if (!rows.length) { section.style.display = "none"; return; }
+        section.style.display = "";
+        const tbody = $("apps");
+        tbody.textContent = "";
+        for (const s of rows) {
+          const tr = document.createElement("tr");
+          for (const [text, cls] of [[s.source, ""], ["$" + s.today.toFixed(4), "r"], ["$" + s.total.toFixed(4), "r"]]) {
+            const td = document.createElement("td");
+            td.textContent = text;
+            if (cls) td.className = cls;
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+        }
+      } catch (e) { console.error(e); }
+    }
+
     // Refresh full history once per hour to absorb any backfill / midnight rollover.
     setInterval(loadChart, 3600 * 1000);
+    setInterval(loadAttribution, 5 * 60 * 1000);
 
     loadChart();
+    loadAttribution();
     connect();
   </script>
 </body>

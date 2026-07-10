@@ -21,6 +21,7 @@ from .store import (
     daily_spend_series,
     init,
     latest_snapshots,
+    read_attribution,
 )
 
 
@@ -80,12 +81,22 @@ def build_digest_payload(tz=None, now_ts: Optional[int] = None) -> dict[str, Any
     total_today = round(sum(d["today"] for d in by_provider.values()), 4)
     total_avg7 = round(sum(d["avg7"] for d in by_provider.values()), 4)
 
+    # Per-source attribution (API keys / projects / ingest tags) over the
+    # digest window — sources with no spend in 8 days are omitted.
+    attribution = read_attribution(8, tz=tzi)
+    by_app = [
+        {"source": s["source"], "today": s["today"], "total_8d": s["total"]}
+        for s in attribution["sources"]
+        if s["total"] > 0
+    ][:10]
+
     return {
         "date": today_str,
         "as_of": now.strftime("%H:%M %Z"),
         "total_today": total_today,
         "total_avg7": total_avg7,
         "by_provider": by_provider,
+        "by_app": by_app,
         "deepgram_balance": deepgram_balance,
         "top_models": top_models,
         "dashboard_url": _dashboard_url(),
@@ -110,6 +121,11 @@ def render_text(p: dict[str, Any]) -> str:
             sign = "+" if d["delta_pct"] >= 0 else ""
             delta = f"  ({sign}{d['delta_pct']:.0f}% vs avg)"
         L.append(f"  {prov:10s} ${d['today']:>9.4f}  (7d avg ${d['avg7']:>8.4f}){delta}")
+
+    if p.get("by_app"):
+        L += ["", "By app (today / last 8 days):"]
+        for a in p["by_app"]:
+            L.append(f"  {a['source']:35s} ${a['today']:>9.4f} / ${a['total_8d']:>9.4f}")
 
     if p["deepgram_balance"] is not None:
         L += ["", f"Deepgram balance: ${p['deepgram_balance']:>9.2f} remaining"]
@@ -138,6 +154,20 @@ def render_html(p: dict[str, Any]) -> str:
             f'<td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;color:#888;font-variant-numeric:tabular-nums;">${d["avg7"]:.4f}</td>'
             f'<td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:right;">{delta}</td>'
             f'</tr>'
+        )
+
+    by_app_html = ""
+    if p.get("by_app"):
+        import html as _html
+        ar = "".join(
+            f'<tr><td style="padding:4px 12px;color:#444;">{_html.escape(a["source"])}</td>'
+            f'<td style="padding:4px 12px;text-align:right;font-variant-numeric:tabular-nums;">${a["today"]:.4f}</td>'
+            f'<td style="padding:4px 12px;text-align:right;color:#888;font-variant-numeric:tabular-nums;">${a["total_8d"]:.4f}</td></tr>'
+            for a in p["by_app"]
+        )
+        by_app_html = (
+            '<h3 style="color:#666;margin-top:32px;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;">By app (today / 8 days)</h3>'
+            f'<table style="width:100%;border-collapse:collapse;font-size:13px;">{ar}</table>'
         )
 
     deepgram_html = ""
@@ -172,7 +202,7 @@ def render_html(p: dict[str, Any]) -> str:
         '<th style="text-align:right;padding:8px 12px;border-bottom:1px solid #ddd;">vs avg</th>'
         '</tr></thead>'
         f'<tbody>{rows}</tbody></table>'
-        f'{deepgram_html}{top_html}'
+        f'{by_app_html}{deepgram_html}{top_html}'
         f'<p style="margin-top:32px;font-size:13px;"><a href="{p["dashboard_url"]}" style="color:#0d6efd;text-decoration:none;">Open dashboard →</a></p>'
         '</body></html>'
     )

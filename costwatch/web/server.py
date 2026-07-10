@@ -22,6 +22,7 @@ from ..mailer import MailError, send as send_mail
 from ..store import (
     SPEND_PROVIDERS,
     local_today_spend,
+    read_attribution,
     read_history,
     record_usage,
     write_snapshot,
@@ -142,6 +143,15 @@ async def history(days: int = 14):
     if not 1 <= days <= 90:
         raise HTTPException(400, "days must be 1..90")
     return read_history(days)
+
+
+@app.get("/api/attribution")
+async def attribution(days: int = 14):
+    """Per-source local-day spend: Anthropic API keys, OpenAI projects,
+    Gemini ingest source tags."""
+    if not 1 <= days <= 90:
+        raise HTTPException(400, "days must be 1..90")
+    return read_attribution(days)
 
 
 @app.post("/api/usage")

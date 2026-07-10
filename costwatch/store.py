@@ -112,6 +112,12 @@ def write_snapshot(state: BillingState) -> int:
         val = fresh.get(prov)
         if val is not None:
             rows.append((ts, prov, float(val), None, by_model_json))
+    # Per-source attribution counters ("anthropic:Recorderbot-key", ...).
+    # Zero-valued sources are skipped to keep the table sparse — a day with no
+    # rows for a source reads as $0 in the delta-sum accounting anyway.
+    for src, val in (getattr(state, "fresh_sources", None) or {}).items():
+        if val is not None and val > 0:
+            rows.append((ts, src, float(val), None, None))
     if state.deepgram_balance_usd is not None:
         rows.append((ts, "deepgram", None, state.deepgram_balance_usd, None))
 
@@ -264,6 +270,63 @@ def latest_snapshots() -> dict[str, dict[str, Any]]:
         provider: {"ts": ts, "today_usd": today, "balance_usd": balance, "by_model": by_model}
         for provider, ts, today, balance, by_model in rows
     }
+
+
+def today_usd_by_gemini_source(provider: str = "gemini") -> dict[str, float]:
+    """{source: usd} for today's (UTC) locally-ingested usage rows."""
+    init()
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = int(today.timestamp())
+    with _conn() as c:
+        rows = c.execute(
+            """
+            SELECT COALESCE(NULLIF(source, ''), 'untagged') AS src, model,
+                   COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
+            FROM usage_reports
+            WHERE provider = ? AND ts >= ?
+            GROUP BY src, model
+            """,
+            (provider, start),
+        ).fetchall()
+    out: dict[str, float] = {}
+    for src, model, in_tok, out_tok in rows:
+        in_price, out_price = PRICING_USD_PER_MTOK.get(model, DEFAULT_PRICE)
+        out[src] = out.get(src, 0.0) + (in_tok * in_price + out_tok * out_price) / 1_000_000
+    return out
+
+
+def read_attribution(days: int = 14, tz=None) -> dict[str, Any]:
+    """Per-source local-day spend for every attributed source seen in the
+    window. Sources are snapshot providers containing ':' — e.g.
+    'anthropic:Recorderbot-key', 'openai:Shell', 'gemini:recorderbot'."""
+    init()
+    tzi = _tzinfo(tz)
+    first_ts = int(
+        (datetime.now(tzi) - timedelta(days=days - 1))
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .timestamp()
+    )
+    with _conn() as c:
+        srcs = [
+            row[0]
+            for row in c.execute(
+                "SELECT DISTINCT provider FROM snapshots "
+                "WHERE ts >= ? AND provider LIKE '%:%' ORDER BY provider",
+                (first_ts,),
+            )
+        ]
+    sources = []
+    for src in srcs:
+        series = daily_spend_series(src, days, tz=tzi)
+        total = round(sum(v for _d, v in series), 4)
+        sources.append({
+            "source": src,
+            "today": series[-1][1],
+            "total": total,
+            "series": [{"date": d, "usd": v} for d, v in series],
+        })
+    sources.sort(key=lambda s: -s["total"])
+    return {"days": days, "sources": sources}
 
 
 def today_usd_by_provider(provider: str) -> float:

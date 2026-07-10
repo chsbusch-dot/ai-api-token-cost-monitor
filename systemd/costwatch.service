@@ -6,8 +6,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/token-watch
+# .env carries non-secret config only; credentials are fetched from Bitwarden
+# Secrets Manager at start by the launcher (see scripts/costwatch-launch.sh).
 EnvironmentFile=%h/token-watch/.env
-ExecStart=%h/token-watch/.venv/bin/python -m costwatch
+ExecStart=%h/token-watch/scripts/costwatch-launch.sh
 Restart=on-failure
 RestartSec=5s
 # Don't wait forever for SSE / long-poll connections to close on shutdown.

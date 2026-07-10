@@ -79,6 +79,10 @@ class BillingState:
     # display fields above — so failures leave gaps instead of stale rows.
     # Not included in to_payload().
     fresh_today: dict = field(default_factory=dict)
+    # Per-source attribution fetched this tick, keyed by a "provider:source"
+    # label (e.g. "anthropic:Recorderbot-key", "openai:Shell",
+    # "gemini:recorderbot"). Same freshness semantics as fresh_today.
+    fresh_sources: dict = field(default_factory=dict)
 
     def session_spend_usd(self) -> float:
         return sum(spend.cost_usd(model) for model, spend in self.by_model.items())
