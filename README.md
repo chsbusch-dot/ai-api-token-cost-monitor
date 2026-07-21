@@ -72,7 +72,7 @@ nano .env
 
 # Run the daemon foreground to verify
 python -m costwatch
-# Open http://localhost:8000 in a browser
+# Open http://localhost:8770 in a browser
 ```
 
 To install as a systemd user service so it runs in the background:
@@ -116,7 +116,7 @@ reports. From any code that calls Gemini, capture the response's
 ```python
 import requests
 r = client.models.generate_content(model="gemini-2.5-pro", contents=...)
-requests.post("http://localhost:8000/api/usage", json={
+requests.post("http://localhost:8770/api/usage", json={
     "provider": "gemini",
     "model": r.model,
     "input_tokens": r.usage_metadata.prompt_token_count,
