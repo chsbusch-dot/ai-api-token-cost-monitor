@@ -20,7 +20,7 @@ done
 
 systemctl --user daemon-reload
 
-# Stop any ad-hoc background daemon on port 8000 before starting under systemd.
+# Stop any ad-hoc background daemon on port 8770 before starting under systemd.
 pkill -f "python -m costwatch" 2>/dev/null || true
 sleep 1
 

@@ -176,7 +176,7 @@ def _require_loopback(request: Request) -> None:
 
 
 def _send_budget_alert(fire: dict) -> None:
-    dashboard_url = os.getenv("DASHBOARD_URL", "http://localhost:8000").rstrip("/")
+    dashboard_url = os.getenv("DASHBOARD_URL", "http://localhost:8770").rstrip("/")
     subj = (
         f"costwatch · ALERT · {fire['provider']} {fire['threshold_pct']:.0f}% "
         f"of daily budget (${fire['spend_usd']:.4f} / ${fire['limit_usd']:.2f})"

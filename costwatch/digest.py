@@ -26,7 +26,7 @@ from .store import (
 
 
 def _dashboard_url() -> str:
-    return os.getenv("DASHBOARD_URL", "http://localhost:8000").rstrip("/")
+    return os.getenv("DASHBOARD_URL", "http://localhost:8770").rstrip("/")
 
 
 def build_digest_payload(tz=None, now_ts: Optional[int] = None) -> dict[str, Any]:

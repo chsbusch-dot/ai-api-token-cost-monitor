@@ -5,4 +5,4 @@ After=costwatch.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/curl -fsS --max-time 30 -X POST http://127.0.0.1:8000/admin/digest
+ExecStart=/usr/bin/curl -fsS --max-time 30 -X POST http://127.0.0.1:8770/admin/digest
