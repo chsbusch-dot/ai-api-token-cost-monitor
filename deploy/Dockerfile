@@ -12,6 +12,7 @@ COPY requirements.txt deploy/constraints.txt ./
 RUN pip install -r requirements.txt -c constraints.txt
 
 COPY costwatch ./costwatch
+COPY deploy/digest_schedule.py ./deploy/digest_schedule.py
 
 # store.py keeps the sqlite DB at <repo>/data/costwatch.db, i.e. /app/data here: mount a volume.
 RUN useradd --system --uid 10001 --home-dir /app --shell /usr/sbin/nologin costwatch \
@@ -24,4 +25,8 @@ EXPOSE 8770
 HEALTHCHECK --interval=60s --timeout=5s --retries=3 \
     CMD python -c "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8770/api/history?days=1', timeout=4); sys.exit(0)"
 
-CMD ["python", "-m", "costwatch"]
+# The daily digest trigger runs beside uvicorn (/admin/digest is loopback-only). Run with an
+# init (compose `init: true`) so the background process is reaped; if uvicorn exits, the
+# container exits and restarts both.
+ENV DIGEST_AT=18:00
+CMD ["sh", "-c", "python -u deploy/digest_schedule.py & exec python -m costwatch"]
