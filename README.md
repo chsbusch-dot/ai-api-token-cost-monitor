@@ -224,3 +224,12 @@ naively reading the vendor's "today" counter at that moment reports a
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Container (homelab `.212`)
+
+Since 2026-09-22 (homelab WOR-479) costwatch runs as a container on the LAN app host
+`prd-ubu-apphost` (`.212`) behind `https://costwatch.lan.synviron.com`. This repo owns the image
+(`deploy/Dockerfile`, versions pinned by `deploy/constraints.txt`); the runtime composition
+(volume, env, BWS-piped credentials, the daily digest trigger) lives in homelab-infra
+`provisioning/apphost/costwatch/`. The systemd units under `systemd/` are the legacy `.132`
+deployment, kept for rollback.
