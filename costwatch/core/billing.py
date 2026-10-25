@@ -10,17 +10,23 @@ log = logging.getLogger(__name__)
 
 
 # Per-million-token prices in USD. Conservative; defaults to Sonnet pricing for unknowns
-# so we don't under-report spend. Last verified against vendor pricing pages: 2026-07-08.
+# so we don't under-report spend. Last verified against vendor pricing pages: 2026-07-08
+# (Anthropic rows re-verified 2026-10-25, WOR-932).
 PRICING_USD_PER_MTOK: dict[str, tuple[float, float]] = {
     # Anthropic Claude (Opus line repriced to $5/$25 in 2026)
     "claude-haiku-4-5-20251001": (1.00, 5.00),
     "claude-haiku-4-5": (1.00, 5.00),
     "claude-sonnet-4-6": (3.00, 15.00),
-    "claude-sonnet-5": (2.00, 10.00),         # intro pricing through 2026-08-31, then $3/$15
+    "claude-sonnet-5": (2.00, 10.00),         # intro price made standard; the $3/$15 rise was cancelled
+    "claude-sonnet-5-5": (2.00, 10.00),
     "claude-opus-4-6": (5.00, 25.00),
     "claude-opus-4-7": (5.00, 25.00),
     "claude-opus-4-8": (5.00, 25.00),
+    "claude-opus-5": (5.00, 25.00),
+    "claude-opus-5-5": (4.00, 20.00),
     "claude-fable-5": (10.00, 50.00),
+    "claude-fable-5-1": (10.00, 50.00),
+    "claude-haiku-5-5": (0.10, 0.50),         # prompts up to 100K tokens; $0.50/$2.50 above
     # OpenAI
     "gpt-4o-mini": (0.15, 0.60),
     "gpt-4o": (2.50, 10.00),
