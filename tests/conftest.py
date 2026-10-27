@@ -25,6 +25,15 @@ def _isolate_db(monkeypatch, tmp_path):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_real_admin_api(monkeypatch):
+    """The digest's by-workspace section calls the Anthropic Admin API: point it at a dead
+    loopback port so no test can reach the real API, whatever key the env holds."""
+    from costwatch import workspaces
+    monkeypatch.setattr(workspaces, "API", "http://127.0.0.1:9/v1/organizations")
+    yield
+
+
 @pytest.fixture
 def project_root() -> Path:
     return Path(__file__).resolve().parent.parent

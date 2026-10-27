@@ -98,6 +98,8 @@ full list. The minimum to get value from costwatch:
 | `OPENAI_ADMIN_API_KEY` | Live OpenAI spend (admin key from platform.openai.com → Organization → Admin keys) |
 | `DEEPGRAM_ADMIN_API_KEY` | Deepgram remaining balance (Member or Owner role at console.deepgram.com → API Keys) |
 | `SMTP_HOST`, `DIGEST_FROM`, `DIGEST_TO` | Daily email digest |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | The same daily digest as a Telegram message |
+| `ANTHROPIC_MONTHLY_CREDITS_USD`, `ANTHROPIC_CREDIT_CYCLE_DAY` | In the digest's Claude-by-workspace section (needs the Admin key): spend per Console workspace today and since the credit cycle began, against monthly API credits (e.g. `200` and the cycle's day of month) |
 
 Budget caps are optional:
 
