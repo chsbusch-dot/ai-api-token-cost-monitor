@@ -17,6 +17,7 @@ from ..budgets import evaluate as evaluate_budgets, record_sent as record_alert_
 from ..core.billing import BillingTracker
 from ..core.billing_fetchers import billing_poller
 from ..digest import build_digest_payload, render_html, render_text
+from .. import telegram
 from ..events import EventBus
 from ..mailer import MailError, send as send_mail
 from ..store import (
@@ -203,13 +204,20 @@ async def admin_digest(request: Request):
     _require_loopback(request)
     p = build_digest_payload()
     subject = f"costwatch · {p['date']} · ${p['total_today']:.4f} total"
+    # Telegram first and on its own: a mail failure must not cost the phone copy, and the
+    # scheduler fires once a day with no retry, so nothing is ever sent twice.
+    try:
+        tg = "sent" if telegram.send(render_text(p)) else "off"
+    except telegram.TelegramError as e:
+        log.warning("digest telegram failed: %s", e)
+        tg = "failed"
     try:
         send_mail(subject, render_html(p), render_text(p))
     except MailError as e:
         raise HTTPException(500, f"mail config: {e}")
     except Exception as e:
         raise HTTPException(502, f"smtp error: {e}")
-    return {"ok": True, "to": os.getenv("DIGEST_TO"), "total_today": p["total_today"]}
+    return {"ok": True, "to": os.getenv("DIGEST_TO"), "total_today": p["total_today"], "telegram": tg}
 
 
 @app.post("/admin/test_email")
